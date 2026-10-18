@@ -97,16 +97,32 @@ jobs:
 
       # 图片需要 https 外链才能被 Server酱 展示：用 GitHub Pages（gh-pages 分支）承载
 
+      # 图片需要 https 外链才能被 Server酱 展示：用 GitHub Pages（gh-pages 分支）承载。
+      # 这里把 out/ 变成一个独立的 git 仓库：
+      #   已有 gh-pages → 浅克隆进来；没有 → 新建并建好分支和远端。
+      # 远端统一用带 token 的地址，避免依赖 actions/checkout 注入的凭据（新建仓库拿不到）。
       - name: 准备图床目录 gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            git worktree add -f out gh-pages
+          AUTH_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          rm -rf out
+          if git ls-remote --exit-code --heads "$AUTH_URL" gh-pages >/dev/null 2>&1; then
+            echo "远程已有 gh-pages 分支，克隆到 out/"
+            git clone --quiet --depth=1 --branch gh-pages "$AUTH_URL" out
           else
-            echo "gh-pages 分支不存在，创建空目录（首次发布）"
+            echo "远程没有 gh-pages 分支，本次为首次发布"
             mkdir -p out
+            git -C out init -q
+            git -C out checkout -q -b gh-pages
+            git -C out remote add origin "$AUTH_URL"
           fi
-          ls -la out | head -5
+          # gh-pages 只放图片：忽略其余文件（manifest.json 等不进版本库）
+          printf '*\n!*.png\n!.nojekyll\n!.gitignore\n' > out/.gitignore
+          touch out/.nojekyll
+          echo "当前内容："
+          ls -la out | head -10
 
       - name: 抓取数据并生成预测图
         env:
@@ -118,10 +134,14 @@ jobs:
           # 时段决定“发哪几天”：afternoon=当天晚霞+次日朝霞；evening=次日朝霞+次日晚霞
           ARGS=(--dry-run --slot "$PUSH_SLOT" --mode "$MODE")
           [ -n "$PLACE_ARG" ] && ARGS+=(--place "$PLACE_ARG")
-          # gh-pages 里的 out/ 子目录 → https://<owner>.github.io/<repo>/out/xxx.png
           OWNER=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
-          export IMAGE_BASE_URL="https://${OWNER}.github.io/${REPO_NAME}/out"
+          # 图片直接放在 gh-pages 根目录；repo 形如 <owner>.github.io 时站点在根路径
+          if [ "${REPO_NAME,,}" = "${OWNER}.github.io" ]; then
+            export IMAGE_BASE_URL="https://${OWNER}.github.io"
+          else
+            export IMAGE_BASE_URL="https://${OWNER}.github.io/${REPO_NAME}"
+          fi
           echo "图片前缀：$IMAGE_BASE_URL"
           node scripts/push.mjs "${ARGS[@]}"
 
@@ -150,11 +170,6 @@ jobs:
           # 只保留最近 3 天的图片，避免仓库无限增长
           find out -maxdepth 1 -name '*.png' -mtime +3 -delete
           cd out
-          if [ ! -d .git ] && [ ! -f .git ]; then
-            git init -q
-            git checkout -q -b gh-pages
-            git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
@@ -164,12 +179,14 @@ jobs:
           fi
           git commit -q -m "chore: 更新预测图 $(date '+%Y-%m-%d %H:%M %Z')"
           git push -q origin HEAD:gh-pages
+          echo "已发布：" && git show --stat --oneline HEAD | head -20
 
       # GitHub Pages 部署有延迟：等图片真的能访问了再推送，避免 Server酱 抓图失败
 
       - name: 等待图片公网可用
         env:
           DRY_RUN: ${{ steps.plan.outputs.dry_run }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then echo "dry-run 跳过"; exit 0; fi
           node scripts/wait-images.mjs || true
@@ -190,5 +207,9 @@ jobs:
           fi
           OWNER=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
-          export IMAGE_BASE_URL="https://${OWNER}.github.io/${REPO_NAME}/out"
+          if [ "${REPO_NAME,,}" = "${OWNER}.github.io" ]; then
+            export IMAGE_BASE_URL="https://${OWNER}.github.io"
+          else
+            export IMAGE_BASE_URL="https://${OWNER}.github.io/${REPO_NAME}"
+          fi
           node scripts/push.mjs --add-image-urls

@@ -16,7 +16,7 @@ lib/card.js    ← 组装“分享预测图”入参
         ▼
 lib/render.js  ← Canvas 绘制 750×H @2x PNG（与站点版式一致）
         │
-        ├─→ gh-pages 分支（GitHub Pages）→ https://<owner>.github.io/<repo>/out/xxx.png
+        ├─→ gh-pages 分支（GitHub Pages）→ https://<owner>.github.io/<repo>/xxx.png
         ▼
 lib/serverchan.js → sctapi.ftqq.com（SCT） / <num>.push.ft07.com（SC3） → 微信
 ```
@@ -29,7 +29,7 @@ lib/serverchan.js → sctapi.ftqq.com（SCT） / <num>.push.ft07.com（SC3） �
    （[sct.ftqq.com](https://sct.ftqq.com) 拿 `SCT...`；[sc3.ft07.com](https://sc3.ft07.com) 拿 `sctp...`，两种都支持）。
 3. 修改 `config.json`，填上你要关注的地点。
 4. 仓库 **Settings → Pages**：Source 选 **Deploy from a branch**，分支选 `gh-pages`，目录 `/ (root)`。
-   > 第一次运行结束后 `gh-pages` 分支才会出现，出现后再来设置即可；图片路径是 `out/xxx.png`。
+   > 第一次运行结束后 `gh-pages` 分支才会出现，出现后再来设置即可；图片直接放在分支根目录，地址是 `https://<owner>.github.io/<repo>/xxx.png`。
 5. **Actions → Sunset Push → Run workflow**，`dry_run` 先留 `true` 跑一遍，确认图片和日志都正常，
    再取消勾选跑一次真实推送。
 
@@ -215,13 +215,13 @@ node scripts/push.mjs --slot evening
 
 - 评分 / 评级 / 时刻 / 可见时段 / 色彩 / 云状 / 云底 / 云边界 / 通透度 / AOD
 - 关键提示（例如“霞光深入距离小于云边界距离，本地头顶无火烧云”）
-- 预测图（`![](https://<owner>.github.io/<repo>/out/xxx.png)`）与大图链接
+- 预测图（`![](https://<owner>.github.io/<repo>/xxx.png)`）与大图链接
 
 ### 图片为什么走 GitHub Pages
 
 Server酱 的 `desp` 只支持 **https 外链图片**，而 Actions 里的本地文件它访问不到。
 所以工作流的顺序是：
-**生成图片 → 提交到 `gh-pages` → 轮询等图片真的能访问（最多 4 分钟）→ 再推送**。
+**生成图片 → 提交到 `gh-pages` → 轮询等图片真的能访问（最多 3 分钟）→ 再推送**。
 如果 GitHub Pages 一直没部署成功，推送仍会发出，只是正文里少了图片。
 
 > Fork 后如果使用私有仓库注意：私有仓库的 GitHub Pages 对公开访问可能受限，图片可能无法被 Server酱 抓取，

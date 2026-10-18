@@ -341,6 +341,7 @@ async function main() {
   const jobs = selectJobs(config, opts);
   const todayByPlace = new Map(jobs.map((j) => [j.location.name, zonedNow(j.location.timezone).dateISO]));
   const manifest = [];
+  const baseUrl = (process.env.IMAGE_BASE_URL || '').replace(/\/+$/, '');
   let failed = 0;
 
   console.log(`[计划] 时段「${opts.slot}」，共 ${jobs.length} 条`);
@@ -364,7 +365,10 @@ async function main() {
       const fileName = `${location.name}-${mode}-${dateISO}.png`;
       const png = renderPredictionCard(card);
       fs.writeFileSync(path.join(OUT_DIR, fileName), png);
-      const { title, desp } = buildMessage(card, null, rel);
+      // 生成阶段就把图片公网地址写进 manifest：
+      // 后续「等待图片可用」要靠它轮询，推送阶段也能直接复用，避免图裂。
+      const imageUrl = baseUrl ? `${baseUrl}/${encodeURIComponent(fileName)}` : null;
+      const { title, desp } = buildMessage(card, imageUrl, rel);
       console.log(`${label} 评分 ${card.score}（${card.ratingLabel}）→ out/${fileName}`);
 
       manifest.push({
@@ -379,7 +383,7 @@ async function main() {
         eventTime: card.eventTime,
         title,
         desp,
-        imageUrl: null,
+        imageUrl,
         card,
       });
     } catch (err) {
