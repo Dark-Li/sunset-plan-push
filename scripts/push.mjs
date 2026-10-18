@@ -274,40 +274,104 @@ function buildMessage(card, imageUrl, relation = '今天') {
   return { title, desp: lines.join('\n') };
 }
 
-async function sendAll(manifest, opts) {
-  const sendKey = process.env.SERVERCHAN_SENDKEY;
-  if (!sendKey) throw new Error('未设置 SERVERCHAN_SENDKEY 环境变量（或使用 --dry-run 只生成图片）');
-  const baseUrl = (process.env.IMAGE_BASE_URL || '').replace(/\/+$/, '');
+const MODE_ORDER = { sunrise: 0, sunset: 1 };
 
-  let ok = 0;
-  let failed = 0;
-  for (const item of manifest) {
-    try {
-      const imageUrl = item.imageUrl || (baseUrl ? `${baseUrl}/${item.file}` : null);
-      if (baseUrl && imageUrl !== item.imageUrl) {
-        item.imageUrl = imageUrl;
-        const rebuilt = buildMessage(item.card, imageUrl, item.relation);
-        item.title = rebuilt.title;
-        item.desp = rebuilt.desp;
-      }
-      await pushMessage({
-        sendKey,
-        title: item.title,
-        desp: item.desp,
-        options: {
-          tags: '晚霞预报|SunsetPlan',
-          short: `${item.relation === '今天' ? '' : item.relation}${item.modeLabel} ${item.score} 分 · ${item.ratingLabel} · ${item.eventTime}`,
-        },
-      });
-      ok++;
-      console.log(`[${item.place} ${item.date} ${item.mode}] 推送成功`);
-    } catch (err) {
-      failed++;
-      console.error(`[${item.place} ${item.date} ${item.mode}] 推送失败：${err.message}`);
+/**
+ * 把一次定时任务里的所有结果合并成「一条」推送。
+ * 同一天的多条霞会归到同一个地点小标题下，图片全部带上。
+ * @param {Array} items manifest 条目（含 card 与 imageUrl）
+ */
+function buildCombinedMessage(items) {
+  // 排序：日期 → 地点 → 霞别，保证同一（地点+日期）的条目连在一起，小标题不重复
+  const sorted = [...items].sort((a, b) => {
+    if (a.date !== b.date) return a.date.localeCompare(b.date);
+    if (a.place !== b.place) return a.place.localeCompare(b.place, 'zh');
+    return (MODE_ORDER[a.mode] ?? 9) - (MODE_ORDER[b.mode] ?? 9);
+  });
+
+  const places = [...new Set(sorted.map((i) => i.place))];
+  const placeLabel =
+    places.length <= 2 ? places.join('/') : `${places.slice(0, 2).join('/')}等${places.length}地`;
+  // 单个地点：把各条分数写进标题（今晚霞75 明朝霞71）
+  // 多个地点：只报数量和最高分，避免"哪个分数属于谁"的歧义
+  const scoreOne = (i) => {
+    const relShort = i.relation === '今天' ? '今' : i.relation === '明天' ? '明' : i.relation === '后天' ? '后' : '';
+    return `${relShort}${i.modeLabel}${i.score}`;
+  };
+  let title;
+  let short;
+  if (places.length === 1) {
+    const parts = sorted.map(scoreOne);
+    title = `${placeLabel} ${parts.join(' ')}`;
+    short = parts.join(' ');
+  } else {
+    const best = sorted.reduce((a, b) => (b.score > a.score ? b : a), sorted[0]);
+    title = `${placeLabel} ${sorted.length}条 最高${best.score}分`;
+    short = `${sorted.length}条 · 最高 ${best.score} 分`;
+  }
+
+  const lines = [];
+  let lastGroup = null;
+
+  for (const item of sorted) {
+    const card = item.card;
+    const e = card.extra;
+    const groupKey = `${item.place}|${item.date}`;
+    if (groupKey !== lastGroup) {
+      const dayText = item.relation && item.relation !== '今天'
+        ? `${item.relation}（${card.dateLabel}）`
+        : card.dateLabel;
+      if (lines.length) lines.push('', '---', '');
+      lines.push(`## ${item.place} · ${dayText}`);
+      lastGroup = groupKey;
+    }
+
+    lines.push(
+      '',
+      `**${card.modeLabel} · ${card.score} 分 · ${card.ratingLabel}**`,
+      `- ${card.modeLabel}时刻：**${card.eventTime}**（日出 ${e.sunrise} / 日落 ${e.sunset}）`,
+      `- 可见时段：${card.timeRange}`,
+      `- 色彩：${card.colorName}（\`${card.colorHex}\`）`,
+      `- 云状：${e.cloudName}（${e.cloudCode}）`,
+      `- 云底 ${card.metrics[0].value} · 云边界 ${card.metrics[1].value} · 通透度 ${card.metrics[3].value} · AOD ${card.metrics[4].value}`,
+      `- 多维评分：${factorBar(e.factors)}`,
+    );
+    const tip = e.notes.find((n) => /云边界|霞光|透过率|晴空|阴天|降雨/.test(n));
+    if (tip) lines.push('', `> ${tip}`);
+    if (item.imageUrl) {
+      lines.push('', `![${card.placeName}${card.modeLabel}预测图](${item.imageUrl})`);
     }
   }
-  console.log(`推送完成：成功 ${ok}，失败 ${failed}`);
-  if (failed) process.exitCode = 1;
+
+  lines.push('', '[查看交互版](https://sunset-plan.vercel.app)');
+
+  return { title, desp: lines.join('\n'), short };
+}
+
+/** 一次任务只推送一条（多条结果合并），返回是否成功 */
+async function sendAll(manifest) {
+  const sendKey = process.env.SERVERCHAN_SENDKEY;
+  if (!sendKey) throw new Error('未设置 SERVERCHAN_SENDKEY 环境变量（或使用 --dry-run 只生成图片）');
+  if (!manifest.length) {
+    console.log('没有待推送内容');
+    return;
+  }
+
+  const baseUrl = (process.env.IMAGE_BASE_URL || '').replace(/\/+$/, '');
+  for (const item of manifest) {
+    if (!item.imageUrl && !item.imageUnavailable && baseUrl) item.imageUrl = `${baseUrl}/${encodeURIComponent(item.file)}`;
+  }
+
+  const { title, desp, short } = buildCombinedMessage(manifest);
+  console.log(`推送 1 条合并消息，含 ${manifest.length} 张预报：${manifest.map((i) => i.file).join(', ')}`);
+
+  await pushMessage({
+    sendKey,
+    title,
+    desp,
+    options: { tags: '晚霞预报|SunsetPlan', short },
+  });
+  console.log(`推送成功：${title}`);
 }
 
 // ---------- 主流程 ----------
@@ -326,14 +390,17 @@ async function main() {
       return;
     }
     if (opts.dryRun) {
-      for (const m of manifest) {
-        console.log('\n----- 推送预览 -----');
-        console.log('标题：', m.title);
-        console.log(m.desp);
+      const baseUrl = (process.env.IMAGE_BASE_URL || '').replace(/\/+$/, '');
+      for (const item of manifest) {
+        if (!item.imageUrl && !item.imageUnavailable && baseUrl) item.imageUrl = `${baseUrl}/${encodeURIComponent(item.file)}`;
       }
+      const preview = buildCombinedMessage(manifest);
+      console.log('\n----- 推送预览（合并为 1 条）-----');
+      console.log('标题：', preview.title);
+      console.log(preview.desp);
       return;
     }
-    await sendAll(manifest, opts);
+    await sendAll(manifest);
     return;
   }
 
@@ -362,7 +429,9 @@ async function main() {
         continue;
       }
 
-      const fileName = `${location.name}-${mode}-${dateISO}.png`;
+      // 文件名去掉空格和路径敏感字符，避免 URL 里出现 %20 或意外子目录
+      const safeName = String(location.name).replace(/\s+/g, '').replace(/[/\\:*?"<>|]+/g, '_');
+      const fileName = `${safeName}-${mode}-${dateISO}.png`;
       const png = renderPredictionCard(card);
       fs.writeFileSync(path.join(OUT_DIR, fileName), png);
       // 生成阶段就把图片公网地址写进 manifest：
@@ -395,13 +464,14 @@ async function main() {
   fs.writeFileSync(MANIFEST, JSON.stringify(manifest, null, 2));
 
   if (opts.dryRun) {
-    for (const m of manifest) {
-      console.log('\n----- 推送预览 -----');
-      console.log('标题：', m.title);
-      console.log(m.desp);
+    if (manifest.length) {
+      const preview = buildCombinedMessage(manifest);
+      console.log('\n----- 推送预览（合并为 1 条）-----');
+      console.log('标题：', preview.title);
+      console.log(preview.desp);
     }
   } else {
-    await sendAll(manifest, opts);
+    await sendAll(manifest);
   }
 
   if (failed && failed === jobs.length) process.exit(1);
