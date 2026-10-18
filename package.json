@@ -1,0 +1,19 @@
+{
+  "name": "sunset-plan-push",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "定时抓取指定地点的朝霞/晚霞预测，生成预测图并通过 Server酱推送（GitHub Actions 触发）",
+  "scripts": {
+    "start": "node scripts/push.mjs",
+    "preview": "node scripts/push.mjs --slot afternoon --dry-run",
+    "preview:evening": "node scripts/push.mjs --slot evening --dry-run",
+    "probe": "node scripts/probe.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.65"
+  }
+}

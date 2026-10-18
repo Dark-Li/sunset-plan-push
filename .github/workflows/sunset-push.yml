@@ -1,0 +1,194 @@
+name: Sunset Push
+
+on:
+  schedule:
+    # cron 使用 UTC，已按北京时间（UTC+8）换算；GitHub 定时任务高峰期可能延迟十几分钟。
+    #   05:00 UTC = 13:00 北京 → 午后班：当天晚霞 + 明天朝霞
+    #   12:00 UTC = 20:00 北京 → 晚间班：明天朝霞 + 明天晚霞
+    # 只有这两班；失败时可在 Actions 页面手动 Run workflow（选 slot）补发，避免重复推送。
+    - cron: '0 5 * * *'
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: '推送时段'
+        type: choice
+        default: afternoon
+        options: [afternoon, evening]
+      mode:
+        description: '推送类型（一般用 both）'
+        type: choice
+        default: both
+        options: [both, sunset, sunrise]
+      place:
+        description: '只推送指定地点（留空=config.json 中全部）'
+        type: string
+        default: ''
+      dry_run:
+        description: '只生成图片不推送'
+        type: boolean
+        default: false
+
+concurrency:
+  group: sunset-push
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 用于把预测图发布到 gh-pages 分支
+    env:
+      TZ: Asia/Shanghai
+    steps:
+
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 安装中文字体（渲染预测图必需）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+          fc-cache -f >/dev/null
+          fc-list :lang=zh | head -3
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 确定推送参数
+        id: plan
+        env:
+          INPUT_SLOT: ${{ github.event.inputs.slot }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_PLACE: ${{ github.event.inputs.place }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            case "$SCHEDULE" in
+              "0 5 * * *")   SLOT=afternoon ;;   # 13:00 北京
+              *)             SLOT=evening ;;     # 12:00 UTC → 20:00 北京
+            esac
+            MODE=both
+            PLACE_ARG=""
+            DRY=false
+            echo "定时触发：$SCHEDULE → slot=$SLOT"
+          else
+            SLOT="${INPUT_SLOT:-afternoon}"
+            MODE="${INPUT_MODE:-both}"
+            PLACE_ARG="${INPUT_PLACE:-}"
+            DRY="${INPUT_DRY_RUN:-false}"
+            echo "手动触发：slot=$SLOT mode=$MODE dry_run=$DRY"
+          fi
+          {
+            echo "slot=$SLOT"
+            echo "mode=$MODE"
+            echo "place_arg=$PLACE_ARG"
+            echo "dry_run=$DRY"
+          } >> "$GITHUB_OUTPUT"
+
+      # 图片需要 https 外链才能被 Server酱 展示：用 GitHub Pages（gh-pages 分支）承载
+
+      - name: 准备图床目录 gh-pages
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git worktree add -f out gh-pages
+          else
+            echo "gh-pages 分支不存在，创建空目录（首次发布）"
+            mkdir -p out
+          fi
+          ls -la out | head -5
+
+      - name: 抓取数据并生成预测图
+        env:
+          PUSH_SLOT: ${{ steps.plan.outputs.slot }}
+          MODE: ${{ steps.plan.outputs.mode }}
+          PLACE_ARG: ${{ steps.plan.outputs.place_arg }}
+        run: |
+          set -euo pipefail
+          # 时段决定“发哪几天”：afternoon=当天晚霞+次日朝霞；evening=次日朝霞+次日晚霞
+          ARGS=(--dry-run --slot "$PUSH_SLOT" --mode "$MODE")
+          [ -n "$PLACE_ARG" ] && ARGS+=(--place "$PLACE_ARG")
+          # gh-pages 里的 out/ 子目录 → https://<owner>.github.io/<repo>/out/xxx.png
+          OWNER=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          export IMAGE_BASE_URL="https://${OWNER}.github.io/${REPO_NAME}/out"
+          echo "图片前缀：$IMAGE_BASE_URL"
+          node scripts/push.mjs "${ARGS[@]}"
+
+      - name: 上传图片产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunset-images-${{ github.run_id }}
+          path: out/*.png
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: 发布图片到 gh-pages
+        env:
+          DRY_RUN: ${{ steps.plan.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry-run 跳过发布"
+            exit 0
+          fi
+          if ! ls out/*.png >/dev/null 2>&1; then
+            echo "没有图片可发布"
+            exit 0
+          fi
+          # 只保留最近 3 天的图片，避免仓库无限增长
+          find out -maxdepth 1 -name '*.png' -mtime +3 -delete
+          cd out
+          if [ ! -d .git ] && [ ! -f .git ]; then
+            git init -q
+            git checkout -q -b gh-pages
+            git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "图片无变化，跳过提交"
+            exit 0
+          fi
+          git commit -q -m "chore: 更新预测图 $(date '+%Y-%m-%d %H:%M %Z')"
+          git push -q origin HEAD:gh-pages
+
+      # GitHub Pages 部署有延迟：等图片真的能访问了再推送，避免 Server酱 抓图失败
+
+      - name: 等待图片公网可用
+        env:
+          DRY_RUN: ${{ steps.plan.outputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then echo "dry-run 跳过"; exit 0; fi
+          node scripts/wait-images.mjs || true
+
+      - name: 推送 Server酱
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          DRY_RUN: ${{ steps.plan.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "手动 dry-run：跳过推送"
+            exit 0
+          fi
+          if [ -z "${SERVERCHAN_SENDKEY:-}" ]; then
+            echo "::error::未配置 SERVERCHAN_SENDKEY，无法推送（已生成图片并上传为 Artifact）"
+            exit 1
+          fi
+          OWNER=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          export IMAGE_BASE_URL="https://${OWNER}.github.io/${REPO_NAME}/out"
+          node scripts/push.mjs --add-image-urls
